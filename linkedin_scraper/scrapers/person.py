@@ -1,6 +1,8 @@
 """Person/Profile scraper for LinkedIn."""
 
+import asyncio
 import logging
+import re
 from typing import Optional
 from urllib.parse import urljoin
 from playwright.async_api import Page
@@ -11,6 +13,22 @@ from ..callbacks import ProgressCallback, SilentCallback
 from ..core.exceptions import ScrapingError
 
 logger = logging.getLogger(__name__)
+
+# New LinkedIn profile layout (React/RSC, 2026): obfuscated class names, name in <h2>,
+# sections identified by data-testid/componentkey, and headings localized to the UI language.
+ABOUT_HEADINGS = ("About", "Sobre", "Acerca de", "Info", "À propos", "Informazioni")
+TOP_CARD_SELECTOR = (
+    'main section:has(a[href*="/overlay/contact-info/"]), '
+    'main section:has([componentkey^="ProfileVerificationTriggerRef-"])'
+)
+NEW_EXPERIENCE_ITEMS = (
+    '[data-testid^="profile_ExperienceTopLevelSection"] [componentkey^="entity-collection-item"]'
+)
+NEW_EDUCATION_ITEMS = (
+    '[data-testid^="profile_EducationTopLevelSection"] [componentkey^="entity-collection-item"]'
+)
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_DASH_RE = re.compile(r"\s*[–—]\s*")
 
 
 class PersonScraper(BaseScraper):
@@ -52,6 +70,10 @@ class PersonScraper(BaseScraper):
 
             # Wait for main content
             await self.page.wait_for_selector("main", timeout=10000)
+            try:
+                await self.page.wait_for_selector(TOP_CARD_SELECTOR, timeout=10000)
+            except Exception:
+                pass  # old layout or slow load: continue with the fallbacks
             await self.wait_and_focus(1)
 
             # Get name and location
@@ -111,6 +133,20 @@ class PersonScraper(BaseScraper):
 
     async def _get_name_and_location(self) -> tuple[str, Optional[str]]:
         """Extract name and location from profile."""
+        # New layout: name is the <h2> of the top card; location is the <p> next to "Contact info"
+        try:
+            top = self.page.locator(TOP_CARD_SELECTOR).first
+            if await top.count() > 0:
+                name = " ".join((await top.locator("h2").first.inner_text(timeout=3000)).split())
+                location = None
+                loc = top.locator('div:has(> p > a[href*="/overlay/contact-info/"]) > p').first
+                if await loc.count() > 0:
+                    location = " ".join((await loc.inner_text()).split()) or None
+                if name:
+                    return name, location
+        except Exception as e:
+            logger.debug(f"New-layout name/location extraction failed: {e}")
+
         try:
             name = await self.safe_extract_text("h1", default="Unknown")
             location = await self.safe_extract_text(
@@ -134,6 +170,21 @@ class PersonScraper(BaseScraper):
 
     async def _get_about(self) -> Optional[str]:
         """Extract about section."""
+        # New layout: <section> with a localized <h2> and an expandable text box
+        try:
+            sections = await self.page.locator(
+                'main section:has(h2):has([data-testid="expandable-text-box"])'
+            ).all()
+            for section in sections:
+                heading = (await section.locator("h2").first.inner_text()).strip()
+                if any(heading.startswith(h) for h in ABOUT_HEADINGS):
+                    text = await section.locator('[data-testid="expandable-text-box"]').first.inner_text()
+                    text = text.strip()
+                    if text:
+                        return text
+        except Exception as e:
+            logger.debug(f"New-layout about extraction failed: {e}")
+
         try:
             # Find the profile card that contains "About"
             profile_cards = await self.page.locator(
@@ -158,7 +209,9 @@ class PersonScraper(BaseScraper):
 
     async def _get_experiences(self, base_url: str) -> list[Experience]:
         """Extract experiences from the main profile page Experience section."""
-        experiences = []
+        experiences = await self._get_experiences_new_layout()
+        if experiences:
+            return experiences
 
         try:
             experience_heading = self.page.locator('h2:has-text("Experience")').first
@@ -219,6 +272,159 @@ class PersonScraper(BaseScraper):
 
         return experiences
     
+    # ------------------------------------------------------------------
+    # New layout (2026): items are [componentkey^="entity-collection-item"]
+    # inside [data-testid^="profile_<Section>TopLevelSection"], text lives in <p>.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _looks_like_date_range(text: str) -> bool:
+        """'2000 – o momento', 'Jan 2020 - Dec 2022 · 2 yrs', '2015'."""
+        if not _YEAR_RE.search(text):
+            return False
+        return bool(re.search(r"[–—-]", text)) or len(text) <= 12
+
+    @staticmethod
+    async def _item_paragraph_texts(item) -> list[str]:
+        """Visible <p> texts of an item, whitespace-normalized, consecutive duplicates removed."""
+        texts: list[str] = []
+        for raw in await item.locator("p").all_inner_texts():
+            text = " ".join(raw.split())
+            if text and (not texts or texts[-1] != text):
+                texts.append(text)
+        return texts
+
+    @staticmethod
+    async def _first_href(item, selector: str) -> Optional[str]:
+        link = item.locator(selector).first
+        if await link.count() > 0:
+            return await link.get_attribute("href")
+        return None
+
+    async def _find_lazy_items(self, selector: str, wait_per_slot: float = 1.0) -> list:
+        """
+        The new profile page is a LazyColumn of slots ("profileCardsExperienceOnly…",
+        "profileCardsBelowActivityPart…") that stay empty until they enter the viewport.
+        The page scrolls inside an inner container, not the window, so window.scrollTo()
+        (used by scroll_page_to_bottom) does not trigger them. Walk the slots in order,
+        scrolling each one into view, until the section's items show up.
+        """
+        items = self.page.locator(selector)
+        if await items.count() > 0:
+            return await items.all()
+
+        column = self.page.locator('main [data-testid="lazy-column"]').first
+        if await column.count() == 0:
+            return []  # old layout: nothing to do here
+
+        viewport = self.page.viewport_size or {"width": 1280, "height": 720}
+        for slot in await column.locator(":scope > *").all():
+            try:
+                # native scrollIntoView scrolls whichever ancestor is the real scroller
+                await slot.evaluate("el => el.scrollIntoView({block: 'center'})")
+                # plus a real wheel event, in case loading listens to user scrolling
+                await self.page.mouse.move(viewport["width"] / 3, viewport["height"] / 2)
+                await self.page.mouse.wheel(0, 200)
+            except Exception as e:
+                logger.debug(f"Could not scroll lazy slot into view: {e}")
+            await asyncio.sleep(wait_per_slot)
+            if await items.count() > 0:
+                await asyncio.sleep(0.5)  # let the card finish rendering
+                return await items.all()
+
+        try:
+            await self.page.wait_for_selector(selector, state="attached", timeout=5000)
+            return await items.all()
+        except Exception:
+            return []
+
+    async def _get_experiences_new_layout(self) -> list[Experience]:
+        """Parse the Experience section of the new layout (main profile page)."""
+        experiences: list[Experience] = []
+        for item in await self._find_lazy_items(NEW_EXPERIENCE_ITEMS):
+            try:
+                texts = await self._item_paragraph_texts(item)
+                if not texts:
+                    continue
+                company_url = await self._first_href(item, 'a[href*="/company/"]')
+                date_idx = [i for i, t in enumerate(texts) if self._looks_like_date_range(t)]
+
+                if len(date_idx) > 1:
+                    # Several roles at one company: [company, (summary), role1, dates1, ..., roleN, datesN]
+                    company = texts[0].split(" · ")[0]
+                    for di in date_idx:
+                        if di == 0:
+                            continue
+                        from_date, to_date, duration = self._parse_work_times(texts[di])
+                        experiences.append(
+                            Experience(
+                                position_title=texts[di - 1],
+                                institution_name=company,
+                                linkedin_url=company_url,
+                                from_date=from_date,
+                                to_date=to_date,
+                                duration=duration,
+                            )
+                        )
+                    continue
+
+                # Single role: [title, company(· type), dates, (location)]
+                first_date = date_idx[0] if date_idx else None
+                company = None
+                if len(texts) > 1 and (first_date is None or first_date > 1):
+                    company = texts[1].split(" · ")[0]
+                location = None
+                if first_date is not None and len(texts) > first_date + 1:
+                    candidate = texts[first_date + 1]
+                    if len(candidate) <= 80:
+                        location = candidate
+                from_date, to_date, duration = self._parse_work_times(
+                    texts[first_date] if first_date is not None else ""
+                )
+                experiences.append(
+                    Experience(
+                        position_title=texts[0],
+                        institution_name=company,
+                        linkedin_url=company_url,
+                        from_date=from_date,
+                        to_date=to_date,
+                        duration=duration,
+                        location=location,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"Error parsing new-layout experience item: {e}")
+        return experiences
+
+    async def _get_educations_new_layout(self) -> list[Education]:
+        """Parse the Education section of the new layout (main profile page)."""
+        educations: list[Education] = []
+        for item in await self._find_lazy_items(NEW_EDUCATION_ITEMS):
+            try:
+                texts = await self._item_paragraph_texts(item)
+                if not texts:
+                    continue
+                url = await self._first_href(item, 'a[href*="/school/"]') or await self._first_href(
+                    item, 'a[href*="/company/"]'
+                )
+                degree = None
+                if len(texts) > 1 and not self._looks_like_date_range(texts[1]):
+                    degree = texts[1]
+                times = next((t for t in texts[1:] if self._looks_like_date_range(t)), "")
+                from_date, to_date = self._parse_education_times(times)
+                educations.append(
+                    Education(
+                        institution_name=texts[0],
+                        degree=degree,
+                        linkedin_url=url,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"Error parsing new-layout education item: {e}")
+        return educations
+
     async def _parse_main_page_experience(self, item) -> Optional[Experience]:
         """Parse experience from main profile page list item with [logo_link, details_link] structure."""
         try:
@@ -498,6 +704,8 @@ class PersonScraper(BaseScraper):
         if not work_times:
             return None, None, None
 
+        work_times = _DASH_RE.sub(" - ", work_times)  # new layout uses en dash: "2000 – o momento"
+
         try:
             # Split by · to separate date range from duration
             parts = work_times.split("·")
@@ -520,7 +728,9 @@ class PersonScraper(BaseScraper):
 
     async def _get_educations(self, base_url: str) -> list[Education]:
         """Extract educations from the main profile page Education section."""
-        educations = []
+        educations = await self._get_educations_new_layout()
+        if educations:
+            return educations
 
         try:
             education_heading = self.page.locator('h2:has-text("Education")').first
@@ -738,6 +948,8 @@ class PersonScraper(BaseScraper):
         """
         if not times:
             return None, None
+
+        times = _DASH_RE.sub(" - ", times)  # new layout uses en dash: "1973 – 1975"
 
         try:
             # Split by " - " to get from and to dates
